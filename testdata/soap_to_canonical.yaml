@@ -1,0 +1,54 @@
+name: "soap_to_canonical"
+version: "1.0.0"
+description: "Maps Enterprise SOAP/XML Transport Order into Tahwell Canonical Schema"
+
+lookups:
+  plants:
+    "PLANT-01": "Central Manufacturing Facility, Industrial Zone 4th Ave No:4"
+    "PLANT-02": "Western Packaging Facility, Logistics Park Blvd No:18"
+    "HUB-03":   "Eastern Cross-Docking Terminal, Harbor Expressway No:8"
+
+rules:
+  - source: "OrderNumber"
+    target: "reference_id"
+    required: true
+
+  - source: "DepartureDate"
+    target: "pickup.scheduled_at"
+    transform: "date_iso8601"
+
+  - source: "PlantCode"
+    target: "pickup.facility_code"
+
+  - source: "PlantCode"
+    target: "pickup.address"
+    lookup: "plants"
+
+  - source: "CustomerTitle"
+    target: "delivery.company_name"
+    transform: "trim"
+    required: true
+
+  - source: "DeliveryAddress"
+    target: "delivery.address"
+    required: true
+
+  - source: "DeliveryCity"
+    target: "delivery.city"
+
+  - source: "PalletCount"
+    target: "cargo.quantity"
+    transform: "to_int"
+    required: true
+
+  - source: "TotalKg"
+    target: "cargo.gross_weight_kg"
+    transform: "to_float"
+    required: true
+
+  - source: "VehicleType"
+    target: "vehicle.vehicle_type"
+    default: "CURTAINSIDER"
+
+  - source: "SpecialNotes"
+    target: "cargo.notes"
