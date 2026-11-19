@@ -1,6 +1,7 @@
 package canonical
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -114,4 +115,33 @@ func (o *TransportOrder) Validate() error {
 		return fmt.Errorf("canonical validation failed: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// ToMap converts TransportOrder to a map[string]any representation.
+func (o *TransportOrder) ToMap() (map[string]any, error) {
+	data, err := json.Marshal(o)
+	if err != nil {
+		return nil, fmt.Errorf("failed marshaling order to map: %w", err)
+	}
+	var res map[string]any
+	if err := json.Unmarshal(data, &res); err != nil {
+		return nil, fmt.Errorf("failed unmarshaling order map: %w", err)
+	}
+	return res, nil
+}
+
+// OrderFromMap creates and validates a TransportOrder from a generic map.
+func OrderFromMap(m map[string]any) (*TransportOrder, error) {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("failed serializing map to order: %w", err)
+	}
+	var order TransportOrder
+	if err := json.Unmarshal(data, &order); err != nil {
+		return nil, fmt.Errorf("failed deserializing order: %w", err)
+	}
+	if err := order.Validate(); err != nil {
+		return nil, err
+	}
+	return &order, nil
 }

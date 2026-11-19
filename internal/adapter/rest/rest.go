@@ -140,3 +140,48 @@ func (c *CarrierClient) CreateShipment(ctx context.Context, order *canonical.Tra
 
 	return &result, nil
 }
+
+// DispatchGeneric posts any JSON-serializable payload to an arbitrary endpoint with optional bearer auth.
+func (c *CarrierClient) DispatchGeneric(ctx context.Context, endpointURL, token string, payload any) (map[string]any, error) {
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed marshaling payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed building http request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else if c.apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiToken)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error during dispatch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("endpoint returned HTTP %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	if len(bytes.TrimSpace(respBytes)) == 0 {
+		return map[string]any{"status": "ok"}, nil
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(respBytes, &res); err != nil {
+		return map[string]any{"status": "ok", "raw_response": string(respBytes)}, nil
+	}
+	return res, nil
+}

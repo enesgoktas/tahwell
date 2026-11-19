@@ -127,4 +127,130 @@ rules:
 			t.Fatal("expected error for missing required field, got nil")
 		}
 	})
+
+	t.Run("Two-pass Canonical Order Transformation", func(t *testing.T) {
+		input := map[string]any{
+			"OrderHeader": map[string]any{
+				"OrderNo":       "ORD-99911",
+				"PlantCode":     "PLANT-01",
+				"DepartureTime": "20.11.2026 10:00",
+			},
+			"Cargo": map[string]any{
+				"WeightInTons": "12.0",
+				"PalletCount":  "15",
+			},
+			"Delivery": map[string]any{
+				"Customer": "Target Supermarket",
+			},
+		}
+
+		canonicalMap, err := engine.Transform(spec, input)
+		if err != nil {
+			t.Fatalf("Transform to canonical map failed: %v", err)
+		}
+		if canonicalMap["reference_id"] != "ORD-99911" {
+			t.Errorf("expected ORD-99911, got %v", canonicalMap["reference_id"])
+		}
+
+		// Outbound conversion
+		outboundSpecYAML := `
+name: "canonical_to_carrier"
+version: "1.0.0"
+rules:
+  - source: "reference_id"
+    target: "carrier_ref"
+  - source: "cargo.gross_weight_kg"
+    target: "weight"
+`
+		outboundSpec, err := LoadSpecFromYAML([]byte(outboundSpecYAML))
+		if err != nil {
+			t.Fatalf("failed loading outbound spec: %v", err)
+		}
+
+		outboundPayload, err := engine.Transform(outboundSpec, canonicalMap)
+		if err != nil {
+			t.Fatalf("Transform to outbound failed: %v", err)
+		}
+		if outboundPayload["carrier_ref"] != "ORD-99911" {
+			t.Errorf("expected carrier_ref ORD-99911, got %v", outboundPayload["carrier_ref"])
+		}
+		if outboundPayload["weight"] != 12000.0 {
+			t.Errorf("expected weight 12000, got %v", outboundPayload["weight"])
+		}
+	})
+
+	t.Run("Status Event Two-Pass Transformation", func(t *testing.T) {
+		statusInboundYAML := `
+name: "carrier_webhook_to_status"
+version: "1.0.0"
+rules:
+  - source: "trip_code"
+    target: "carrier_trip_code"
+    required: true
+  - source: "order_id"
+    target: "order_reference_id"
+  - source: "milestone"
+    target: "status"
+    required: true
+  - source: "occurred_at"
+    target: "timestamp"
+    transform: "date_iso8601"
+  - source: "pod_link"
+    target: "pod_url"
+`
+		statusSpec, err := LoadSpecFromYAML([]byte(statusInboundYAML))
+		if err != nil {
+			t.Fatalf("failed loading status spec: %v", err)
+		}
+
+		carrierWebhook := map[string]any{
+			"trip_code":   "TRIP-88899",
+			"order_id":    "ORD-90412",
+			"milestone":   "DELIVERED",
+			"occurred_at": "20.11.2026 16:45:00",
+			"pod_link":    "https://storage.carrier.example/pod/88899.pdf",
+		}
+
+		statusMap, err := engine.Transform(statusSpec, carrierWebhook)
+		if err != nil {
+			t.Fatalf("Transform to canonical status failed: %v", err)
+		}
+		if statusMap["carrier_trip_code"] != "TRIP-88899" {
+			t.Errorf("expected TRIP-88899, got %v", statusMap["carrier_trip_code"])
+		}
+		if statusMap["status"] != "DELIVERED" {
+			t.Errorf("expected DELIVERED, got %v", statusMap["status"])
+		}
+		if statusMap["pod_url"] != "https://storage.carrier.example/pod/88899.pdf" {
+			t.Errorf("expected POD URL, got %v", statusMap["pod_url"])
+		}
+
+		// Transform from canonical status map to ERP callback payload
+		erpCallbackYAML := `
+name: "status_to_erp_callback"
+version: "1.0.0"
+rules:
+  - source: "order_reference_id"
+    target: "erp_order_number"
+  - source: "status"
+    target: "delivery_status"
+  - source: "pod_url"
+    target: "proof_of_delivery"
+`
+		erpSpec, err := LoadSpecFromYAML([]byte(erpCallbackYAML))
+		if err != nil {
+			t.Fatalf("failed loading erp callback spec: %v", err)
+		}
+
+		erpPayload, err := engine.Transform(erpSpec, statusMap)
+		if err != nil {
+			t.Fatalf("Transform to ERP callback failed: %v", err)
+		}
+		if erpPayload["erp_order_number"] != "ORD-90412" {
+			t.Errorf("expected erp_order_number ORD-90412, got %v", erpPayload["erp_order_number"])
+		}
+		if erpPayload["delivery_status"] != "DELIVERED" {
+			t.Errorf("expected delivery_status DELIVERED, got %v", erpPayload["delivery_status"])
+		}
+	})
 }

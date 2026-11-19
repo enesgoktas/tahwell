@@ -74,36 +74,64 @@ make run
 
 Server starts on `http://127.0.0.1:8080`:
 - **Health Check:** `GET /health`
-- **Inbound SOAP Endpoint:** `POST /api/v1/inbound/orders/soap`
+- **Inbound Orders Endpoint (Format-Agnostic):** `POST /api/v1/inbound/orders`
+- **Inbound Orders with Profile:** `POST /api/v1/inbound/orders/{profile_id}`
+- **Inbound Legacy SOAP Endpoint:** `POST /api/v1/inbound/orders/soap`
+- **Carrier Webhook Endpoint (Bi-directional):** `POST /api/v1/webhooks/carrier`
+- **Carrier Webhook with Profile:** `POST /api/v1/webhooks/carrier/{profile_id}`
 - **Audit Ledger Endpoint:** `GET /api/v1/ledger/events`
 
 ---
 
 ## 🧪 Testing the Live Gateway
 
-### 1. Send a SOAP Transport Order:
+### 1. Send an Inbound Order (JSON or SOAP):
+
+**Format-Agnostic JSON Order:**
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/inbound/orders \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reference_id": "ORD-90412",
+    "pickup": {
+      "facility_code": "PLANT-01",
+      "scheduled_at": "2026-11-20T09:00:00Z"
+    },
+    "delivery": {
+      "company_name": "Distribution Hub North",
+      "address": "Industrial Zone 4th Ave No:12"
+    },
+    "cargo": {
+      "package_type": "PALLET",
+      "quantity": 24,
+      "gross_weight_kg": 18500
+    }
+  }'
+```
+
+**Enterprise SOAP/XML Order:**
 ```bash
 curl -X POST http://127.0.0.1:8080/api/v1/inbound/orders/soap \
   -H "Content-Type: text/xml; charset=utf-8" \
   -d @testdata/sample_soap_order.xml
 ```
 
-#### Sample SOAP Response from Tahwell:
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:thw="http://tahwell.io/schema/transport/v1">
-  <soap:Body>
-    <thw:CreateTransportResponse>
-      <thw:Success>true</thw:Success>
-      <thw:OrderNumber>ORD-90412</thw:OrderNumber>
-      <thw:CarrierTripCode>CARRIER-TRIP-9988</thw:CarrierTripCode>
-      <thw:Message>Shipment dispatched successfully via Tahwell Gateway</thw:Message>
-    </thw:CreateTransportResponse>
-  </soap:Body>
-</soap:Envelope>
+### 2. Ingest Carrier Status Webhooks (Bi-directional Tracking):
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/webhooks/carrier \
+  -H "Content-Type: application/json" \
+  -d '{
+    "order_reference_id": "ORD-90412",
+    "carrier_trip_code": "CARRIER-TRIP-9988",
+    "status": "DELIVERED",
+    "timestamp": "2026-11-20T16:45:00Z",
+    "location": "Distribution Hub North",
+    "pod_url": "https://storage.carrier.example/pod/receipt_9988.pdf",
+    "notes": "Signed by warehouse supervisor"
+  }'
 ```
 
-### 2. Inspect the Audit Ledger:
+### 3. Inspect the Audit Ledger:
 ```bash
 curl -s http://127.0.0.1:8080/api/v1/ledger/events | jq .
 ```
@@ -118,26 +146,33 @@ tahwell/
 │   └── tahwell/
 │       └── main.go              # Application entry point & graceful shutdown
 ├── pkg/
-│   ├── canonical/               # Technology-neutral Canonical Transport Order schema
-│   │   ├── order.go
-│   │   └── order_test.go
-│   └── mapping/                 # Declarative schema transformation engine
-│       ├── rule.go              # Mapping rule and spec definitions
-│       ├── engine.go            # AST & path transformation executor
-│       └── engine_test.go
+│   ├── canonical/               # Technology-neutral Canonical Order & Status schemas
+│   │   ├── order.go             # Canonical TransportOrder model
+│   │   ├── order_test.go
+│   │   ├── status.go            # Canonical StatusEvent milestone model
+│   │   └── status_test.go
+│   ├── mapping/                 # Declarative schema transformation engine & parsers
+│   │   ├── parser.go            # Universal XML/JSON codec & content sniffer
+│   │   ├── parser_test.go
+│   │   ├── rule.go              # Mapping rule and spec definitions
+│   │   ├── engine.go            # AST & path transformation executor
+│   │   └── engine_test.go
+│   └── profile/                 # Integration profile registry (multi-tenant mapping)
+│       ├── profile.go
+│       └── profile_test.go
 ├── internal/
 │   ├── adapter/
 │   │   ├── soap/                # Enterprise SOAP/XML inbound adapter
 │   │   │   ├── soap.go
 │   │   │   └── soap_test.go
-│   │   └── rest/                # Carrier REST JSON outbound adapter
+│   │   └── rest/                # Carrier REST JSON outbound & generic dispatcher
 │   │       ├── rest.go
 │   │       └── rest_test.go
 │   ├── ledger/                  # SQLite-backed immutable event audit ledger
 │   │   ├── ledger.go
 │   │   └── ledger_test.go
 │   └── server/                  # HTTP multiplexer and integration handlers
-│       ├── server.go
+│       ├── server.go            # Format-agnostic orders & bi-directional webhook router
 │       └── server_test.go       # End-to-end integration test suite
 ├── testdata/
 │   ├── sample_soap_order.xml    # Mock SOAP XML order
