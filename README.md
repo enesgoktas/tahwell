@@ -79,6 +79,7 @@ Server starts on `http://127.0.0.1:8080`:
 - **Inbound Legacy SOAP Endpoint:** `POST /api/v1/inbound/orders/soap`
 - **Carrier Webhook Endpoint (Bi-directional):** `POST /api/v1/webhooks/carrier`
 - **Carrier Webhook with Profile:** `POST /api/v1/webhooks/carrier/{profile_id}`
+- **Transactional Outbox Queue:** `GET /api/v1/outbox/tasks` & `GET /api/v1/outbox/stats`
 - **Audit Ledger Endpoint:** `GET /api/v1/ledger/events`
 
 ---
@@ -171,8 +172,14 @@ tahwell/
 │   ├── ledger/                  # SQLite-backed immutable event audit ledger
 │   │   ├── ledger.go
 │   │   └── ledger_test.go
+│   ├── outbox/                  # Durable transactional outbox & exponential-backoff worker
+│   │   ├── task.go
+│   │   ├── store.go
+│   │   ├── store_test.go
+│   │   ├── worker.go
+│   │   └── worker_test.go
 │   └── server/                  # HTTP multiplexer and integration handlers
-│       ├── server.go            # Format-agnostic orders & bi-directional webhook router
+│       ├── server.go            # Format-agnostic orders, webhooks & outbox management
 │       └── server_test.go       # End-to-end integration test suite
 ├── testdata/
 │   ├── sample_soap_order.xml    # Mock SOAP XML order
@@ -188,5 +195,6 @@ tahwell/
 
 1. **Zero External Heavyweight Frameworks:** Utilizes Go 1.22+ standard library `http.ServeMux` for method routing and pattern matching. Zero bloat, maximum performance.
 2. **CGO-Free Embedded SQLite:** Uses `modernc.org/sqlite` (pure Go transcompiled SQLite) ensuring static binaries compile cleanly for Docker `scratch` or cross-platform deployment without GCC/Clang dependencies.
-3. **Idempotency & Immutability:** Inbound requests are recorded in the Event Ledger with a unique UUID (`evt-xxxxxxxx`) and duration metrics, enabling replayability and fail-safe auditing.
-4. **Strict Concurrency Safety:** All packages pass `go test -race ./...` with zero data races.
+3. **Transactional Outbox Resilience:** When target carrier APIs experience temporary outages (5xx, timeouts), orders are durably enqueued in the SQLite outbox. A background worker retries them with exponential backoff + jitter without dropping ERP requests.
+4. **Idempotency & Immutability:** Inbound requests are recorded in the Event Ledger with a unique UUID (`evt-xxxxxxxx`) and duration metrics, enabling replayability and fail-safe auditing.
+5. **Strict Concurrency Safety:** All packages pass `go test -race ./...` with zero data races.

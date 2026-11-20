@@ -41,6 +41,8 @@ func New(dbPath string) (*Ledger, error) {
 	}
 
 	createTableQuery := `
+	PRAGMA journal_mode=WAL;
+	PRAGMA busy_timeout=5000;
 	CREATE TABLE IF NOT EXISTS audit_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		event_id TEXT NOT NULL,
@@ -67,6 +69,11 @@ func New(dbPath string) (*Ledger, error) {
 	}
 
 	return &Ledger{db: db}, nil
+}
+
+// DB exposes the underlying database handle for shared store usage.
+func (l *Ledger) DB() *sql.DB {
+	return l.db
 }
 
 // Record inserts a new event into the ledger.

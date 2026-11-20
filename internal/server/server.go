@@ -14,6 +14,7 @@ import (
 	"github.com/goktasenes/tahwell/internal/adapter/rest"
 	"github.com/goktasenes/tahwell/internal/adapter/soap"
 	"github.com/goktasenes/tahwell/internal/ledger"
+	"github.com/goktasenes/tahwell/internal/outbox"
 	"github.com/goktasenes/tahwell/pkg/canonical"
 	"github.com/goktasenes/tahwell/pkg/mapping"
 	"github.com/goktasenes/tahwell/pkg/profile"
@@ -44,15 +45,29 @@ type Server struct {
 	plantLookups   map[string]string
 	engine         *mapping.Engine
 	profiles       *profile.Registry
+	outboxStore    *outbox.Store
+	outboxWorker   *outbox.Worker
 }
 
-// NewServer builds and configures a new Server instance.
+// NewServer builds and configures a new Server instance with ledger and outbox support.
 func NewServer(l *ledger.Ledger, carrierClient *rest.CarrierClient, defaultShipper, defaultCarrier string, plantLookups map[string]string) *Server {
 	if defaultShipper == "" {
 		defaultShipper = "Enterprise Shipper"
 	}
 	if defaultCarrier == "" {
 		defaultCarrier = "Carrier Logistics"
+	}
+
+	var outboxStore *outbox.Store
+	var outboxWorker *outbox.Worker
+	if l != nil && l.DB() != nil {
+		var err error
+		outboxStore, err = outbox.NewStore(l.DB())
+		if err != nil {
+			log.Printf("[OUTBOX WARN] Failed initializing outbox store: %v", err)
+		} else if carrierClient != nil {
+			outboxWorker = outbox.NewWorker(outboxStore, l, carrierClient, nil)
+		}
 	}
 
 	s := &Server{
@@ -64,6 +79,8 @@ func NewServer(l *ledger.Ledger, carrierClient *rest.CarrierClient, defaultShipp
 		plantLookups:   plantLookups,
 		engine:         mapping.NewEngine(),
 		profiles:       profile.NewRegistry(),
+		outboxStore:    outboxStore,
+		outboxWorker:   outboxWorker,
 	}
 	s.routes()
 	return s
@@ -81,6 +98,30 @@ func (s *Server) ProfileRegistry() *profile.Registry {
 	return s.profiles
 }
 
+// OutboxStore returns the configured outbox store.
+func (s *Server) OutboxStore() *outbox.Store {
+	return s.outboxStore
+}
+
+// OutboxWorker returns the background outbox retry worker.
+func (s *Server) OutboxWorker() *outbox.Worker {
+	return s.outboxWorker
+}
+
+// StartOutbox starts the background retry worker if available.
+func (s *Server) StartOutbox(ctx context.Context) {
+	if s.outboxWorker != nil {
+		s.outboxWorker.Start(ctx)
+	}
+}
+
+// StopOutbox halts the background retry worker.
+func (s *Server) StopOutbox() {
+	if s.outboxWorker != nil {
+		s.outboxWorker.Stop()
+	}
+}
+
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
@@ -89,6 +130,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /api/v1/ledger/events", s.handleListEvents)
+	s.mux.HandleFunc("GET /api/v1/outbox/tasks", s.handleListOutboxTasks)
+	s.mux.HandleFunc("GET /api/v1/outbox/stats", s.handleOutboxStats)
+	s.mux.HandleFunc("POST /api/v1/outbox/tasks/{task_id}/retry", s.handleRetryOutboxTask)
 	s.mux.HandleFunc("POST /api/v1/inbound/orders/soap", s.handleSOAPInbound)
 	s.mux.HandleFunc("POST /api/v1/inbound/orders", s.handleInboundOrder)
 	s.mux.HandleFunc("POST /api/v1/inbound/orders/{profile_id}", s.handleInboundOrderWithProfile)
@@ -102,7 +146,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status":  "ok",
 		"app":     "Tahwell",
-		"version": "1.1.0",
+		"version": "1.2.0",
 	})
 }
 
@@ -121,6 +165,58 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(events)
+}
+
+func (s *Server) handleListOutboxTasks(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.outboxStore == nil {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]any{})
+		return
+	}
+	status := r.URL.Query().Get("status")
+	tasks, err := s.outboxStore.List(r.Context(), status, 50)
+	if err != nil {
+		s.respondJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(tasks)
+}
+
+func (s *Server) handleOutboxStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.outboxStore == nil {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]int64{})
+		return
+	}
+	stats, err := s.outboxStore.Stats(r.Context())
+	if err != nil {
+		s.respondJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleRetryOutboxTask(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	taskID := r.PathValue("task_id")
+	if s.outboxStore == nil {
+		s.respondJSONError(w, "outbox store not configured", http.StatusInternalServerError)
+		return
+	}
+	if err := s.outboxStore.ScheduleRetry(r.Context(), taskID, time.Now().UTC()); err != nil {
+		s.respondJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"task_id": taskID,
+		"message": "Task queued for immediate retry",
+	})
 }
 
 // handleSOAPInbound handles legacy / explicit SOAP/XML inbound requests.
@@ -159,6 +255,27 @@ func (s *Server) processSOAPInboundWithBytes(w http.ResponseWriter, r *http.Requ
 	transformedJSON, _ := json.Marshal(rest.FromCanonical(order))
 	carrierResp, err := s.carrierClient.CreateShipment(r.Context(), order)
 	if err != nil {
+		// Resilience: fallback to outbox for guaranteed delivery
+		if s.outboxStore != nil {
+			taskID := "task-" + uuid.NewString()[:8]
+			targetURL := s.carrierClient.BaseURL() + "/api/v1/shipments"
+			_ = s.outboxStore.Enqueue(r.Context(), &outbox.Task{
+				TaskID:      taskID,
+				ProfileID:   "default",
+				ReferenceID: order.ReferenceID,
+				TaskType:    outbox.TypeOrderDispatch,
+				TargetURL:   targetURL,
+				Payload:     string(transformedJSON),
+				LastError:   err.Error(),
+			})
+			s.recordAudit(r.Context(), eventID, order.ShipperName, s.defaultCarrier, order.ReferenceID, "INBOUND", "SOAP_XML", "REST_JSON", string(rawXML), string(transformedJSON), "QUEUED_FOR_RETRY", "PENDING_RETRY", err.Error(), time.Since(start))
+			soapResp, _ := soap.BuildSOAPResponse(order.ReferenceID, "PENDING_RETRY", "Carrier temporarily unavailable. Order queued in outbox for guaranteed delivery")
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(soapResp)
+			return
+		}
+
 		s.recordAudit(r.Context(), eventID, order.ShipperName, s.defaultCarrier, order.ReferenceID, "INBOUND", "SOAP_XML", "REST_JSON", string(rawXML), string(transformedJSON), "FAILED", "", err.Error(), time.Since(start))
 		s.respondSOAPFault(w, fmt.Sprintf("Carrier integration error: %v", err), http.StatusBadGateway)
 		return
@@ -295,6 +412,24 @@ func (s *Server) processInboundOrder(w http.ResponseWriter, r *http.Request, pro
 		transformedJSON, _ = json.Marshal(outboundPayload)
 		respMap, dispatchErr := s.carrierClient.DispatchGeneric(r.Context(), prof.CarrierEndpointURL, prof.CarrierAuthToken, outboundPayload)
 		if dispatchErr != nil {
+			// Resilience: Enqueue into Outbox
+			if s.outboxStore != nil {
+				taskID := "task-" + uuid.NewString()[:8]
+				_ = s.outboxStore.Enqueue(r.Context(), &outbox.Task{
+					TaskID:      taskID,
+					ProfileID:   profileID,
+					ReferenceID: order.ReferenceID,
+					TaskType:    outbox.TypeOrderDispatch,
+					TargetURL:   prof.CarrierEndpointURL,
+					AuthToken:   prof.CarrierAuthToken,
+					Payload:     string(transformedJSON),
+					LastError:   dispatchErr.Error(),
+				})
+				s.recordAudit(r.Context(), eventID, shipper, carrier, order.ReferenceID, "INBOUND", contentType, "REST_JSON", string(rawBytes), string(transformedJSON), "QUEUED_FOR_RETRY", "PENDING_RETRY", dispatchErr.Error(), time.Since(start))
+				s.respondQueuedOrder(w, r, contentType, order.ReferenceID, taskID)
+				return
+			}
+
 			s.recordAudit(r.Context(), eventID, shipper, carrier, order.ReferenceID, "INBOUND", contentType, "REST_JSON", string(rawBytes), string(transformedJSON), "FAILED", "", dispatchErr.Error(), time.Since(start))
 			s.respondError(w, r, fmt.Sprintf("Carrier dispatch error: %v", dispatchErr), http.StatusBadGateway)
 			return
@@ -311,6 +446,23 @@ func (s *Server) processInboundOrder(w http.ResponseWriter, r *http.Request, pro
 		transformedJSON, _ = json.Marshal(rest.FromCanonical(order))
 		carrierResp, carrierErr := s.carrierClient.CreateShipment(r.Context(), order)
 		if carrierErr != nil {
+			if s.outboxStore != nil {
+				taskID := "task-" + uuid.NewString()[:8]
+				targetURL := s.carrierClient.BaseURL() + "/api/v1/shipments"
+				_ = s.outboxStore.Enqueue(r.Context(), &outbox.Task{
+					TaskID:      taskID,
+					ProfileID:   profileID,
+					ReferenceID: order.ReferenceID,
+					TaskType:    outbox.TypeOrderDispatch,
+					TargetURL:   targetURL,
+					Payload:     string(transformedJSON),
+					LastError:   carrierErr.Error(),
+				})
+				s.recordAudit(r.Context(), eventID, shipper, carrier, order.ReferenceID, "INBOUND", contentType, "REST_JSON", string(rawBytes), string(transformedJSON), "QUEUED_FOR_RETRY", "PENDING_RETRY", carrierErr.Error(), time.Since(start))
+				s.respondQueuedOrder(w, r, contentType, order.ReferenceID, taskID)
+				return
+			}
+
 			s.recordAudit(r.Context(), eventID, shipper, carrier, order.ReferenceID, "INBOUND", contentType, "REST_JSON", string(rawBytes), string(transformedJSON), "FAILED", "", carrierErr.Error(), time.Since(start))
 			s.respondError(w, r, fmt.Sprintf("Carrier integration error: %v", carrierErr), http.StatusBadGateway)
 			return
@@ -458,7 +610,22 @@ func (s *Server) processCarrierWebhook(w http.ResponseWriter, r *http.Request, p
 
 		_, cbErr := s.carrierClient.DispatchGeneric(r.Context(), prof.ERPCallbackURL, "", erpPayload)
 		if cbErr != nil {
-			s.recordAudit(r.Context(), cbEventID, shipper, carrier, refID, "OUTBOUND_CALLBACK", "CANONICAL", "JSON", string(callbackBytes), "", "FAILED", statusEvent.CarrierTripCode, cbErr.Error(), time.Since(cbStart))
+			// Resilience: fallback to outbox for ERP callback
+			if s.outboxStore != nil {
+				cbTaskID := "task-cb-" + uuid.NewString()[:8]
+				_ = s.outboxStore.Enqueue(r.Context(), &outbox.Task{
+					TaskID:      cbTaskID,
+					ProfileID:   profileID,
+					ReferenceID: refID,
+					TaskType:    outbox.TypeERPCallback,
+					TargetURL:   prof.ERPCallbackURL,
+					Payload:     string(callbackBytes),
+					LastError:   cbErr.Error(),
+				})
+				s.recordAudit(r.Context(), cbEventID, shipper, carrier, refID, "OUTBOUND_CALLBACK", "CANONICAL", "JSON", string(callbackBytes), "", "QUEUED_FOR_RETRY", statusEvent.CarrierTripCode, cbErr.Error(), time.Since(cbStart))
+			} else {
+				s.recordAudit(r.Context(), cbEventID, shipper, carrier, refID, "OUTBOUND_CALLBACK", "CANONICAL", "JSON", string(callbackBytes), "", "FAILED", statusEvent.CarrierTripCode, cbErr.Error(), time.Since(cbStart))
+			}
 		} else {
 			s.recordAudit(r.Context(), cbEventID, shipper, carrier, refID, "OUTBOUND_CALLBACK", "CANONICAL", "JSON", string(callbackBytes), "", "DELIVERED_TO_ERP", statusEvent.CarrierTripCode, "", time.Since(cbStart))
 		}
@@ -474,6 +641,26 @@ func (s *Server) processCarrierWebhook(w http.ResponseWriter, r *http.Request, p
 		"order_reference_id": statusEvent.OrderReferenceID,
 		"carrier_trip_code":  statusEvent.CarrierTripCode,
 		"message":            "Status update acknowledged by Tahwell Gateway",
+	})
+}
+
+func (s *Server) respondQueuedOrder(w http.ResponseWriter, r *http.Request, contentType, refID, taskID string) {
+	if strings.Contains(strings.ToLower(contentType), "xml") {
+		soapResp, _ := soap.BuildSOAPResponse(refID, "PENDING_RETRY", "Carrier temporarily unavailable. Order queued in outbox for guaranteed delivery")
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(soapResp)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success":           true,
+		"status":            "QUEUED_FOR_RETRY",
+		"order_number":      refID,
+		"carrier_trip_code": "PENDING_RETRY",
+		"task_id":           taskID,
+		"message":           "Carrier temporarily unavailable. Order enqueued in outbox for automatic delivery.",
 	})
 }
 

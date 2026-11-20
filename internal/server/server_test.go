@@ -365,4 +365,59 @@ rules:
 			t.Errorf("expected to find OUTBOUND_CALLBACK event in ledger for PO-88192")
 		}
 	})
+
+	// 10. Test Outbox Fallback when Carrier is Down
+	t.Run("Outbox Fallback and Recovery on Carrier Failure", func(t *testing.T) {
+		// Temporary broken carrier server returning 503
+		brokenCarrier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"Service temporarily unavailable"}`))
+		}))
+		defer brokenCarrier.Close()
+
+		brokenProfile := &profile.Profile{
+			ID:                 "broken-carrier-profile",
+			Name:               "Broken Carrier Profile",
+			CarrierEndpointURL: brokenCarrier.URL,
+			InboundOrderSpec:   inboundOrderSpec,
+			OutboundOrderSpec:  outboundOrderSpec,
+		}
+		srv.ProfileRegistry().Register(brokenProfile)
+
+		jsonOrder := `{
+			"po_number": "PO-RETRY-777",
+			"origin": {"address": "Plant A", "time": "20.11.2026 09:00"},
+			"destination": {"client": "Client B", "address": "Address B"},
+			"items": {"pallets": 5, "weight_ton": 3.0}
+		}`
+
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/inbound/orders/broken-carrier-profile", strings.NewReader(jsonOrder))
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected HTTP 202 Accepted, got %d", resp.StatusCode)
+		}
+
+		var ack map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&ack)
+		if ack["status"] != "QUEUED_FOR_RETRY" {
+			t.Errorf("expected QUEUED_FOR_RETRY, got %v", ack["status"])
+		}
+
+		// Verify task is in Outbox
+		statsResp, _ := http.Get(ts.URL + "/api/v1/outbox/stats")
+		var stats map[string]int64
+		_ = json.NewDecoder(statsResp.Body).Decode(&stats)
+		statsResp.Body.Close()
+
+		if stats["PENDING"] < 1 {
+			t.Errorf("expected at least 1 pending task in outbox, got %d", stats["PENDING"])
+		}
+	})
 }

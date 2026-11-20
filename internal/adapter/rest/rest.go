@@ -64,6 +64,11 @@ func NewCarrierClient(baseURL, apiToken string, client *http.Client) *CarrierCli
 	}
 }
 
+// BaseURL returns the configured base URL for the carrier API.
+func (c *CarrierClient) BaseURL() string {
+	return c.baseURL
+}
+
 // FromCanonical builds a generic ShipmentCreateRequest from a Canonical TransportOrder.
 func FromCanonical(order *canonical.TransportOrder) ShipmentCreateRequest {
 	vehicleType := "curtainsider_truck"
